@@ -51,8 +51,8 @@ void setup() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
@@ -84,18 +84,21 @@ void setup() {
   if(s) {
     s->set_framesize(s, FRAMESIZE_VGA);    // VGA分辨率
     s->set_quality(s, 10);                 // 稍微提高质量
-    s->set_brightness(s, 2);               // 提高亮度 (-2 到 2)
-    s->set_contrast(s, 2);                 // 提高对比度 (-2 到 2)
-    s->set_saturation(s, 2);              // 增加饱和度 (-2 到 2)
+    s->set_brightness(s, 1);               // 适中亮度 (-2 到 2)
+    s->set_contrast(s, 1);                 // 适中对比度 (-2 到 2)
+    s->set_saturation(s, 0);              // 标准饱和度 (-2 到 2)
     s->set_whitebal(s, 1);                // 开启自动白平衡
     s->set_awb_gain(s, 1);                // 开启自动白平衡增益
-    s->set_gain_ctrl(s, 1);               // 开启自动增益
-    s->set_exposure_ctrl(s, 1);           // 开启自动曝光
-    s->set_aec2(s, 1);                    // 开启自动曝光控制
-    s->set_ae_level(s, 1);                // 稍微提高曝光等级 (-2 到 2)
-    s->set_aec_value(s, 600);             // 设置自动曝光值
-    s->set_gainceiling(s, GAINCEILING_8X);// 设置增益上限
-    Serial.println("Camera parameters adjusted for better brightness");
+    s->set_wb_mode(s, 2);                 // 使用日光模式 (0:自动 1:阳光 2:阴天 3:办公室 4:家里)
+    s->set_gain_ctrl(s, 1);               // 保持自动增益
+    s->set_exposure_ctrl(s, 1);           // 保持自动曝光
+    s->set_aec2(s, 1);                    // 保持自动曝光控制
+    s->set_ae_level(s, 0);                // 标准曝光等级
+    s->set_aec_value(s, 300);             // 降低自动曝光值
+    s->set_gainceiling(s, GAINCEILING_2X);// 进一步降低增益上限
+    s->set_raw_gma(s, 1);                 // 开启伽马校正
+    s->set_lenc(s, 1);                    // 开启镜头校正
+    Serial.println("Camera parameters adjusted for better color balance");
   }
 
   // 配置WiFi
