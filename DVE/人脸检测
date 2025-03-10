@@ -1,0 +1,506 @@
+import cv2
+import time
+import logging
+import os
+import numpy as np
+
+logging.basicConfig(level=logging.DEBUG)
+
+# 使用OpenCV DNN人脸检测模型
+class FaceDetector:
+    def __init__(self, min_confidence=0.5):
+        self.min_confidence = min_confidence
+        
+        # 定义模型路径
+        model_file = "res10_300x300_ssd_iter_140000.caffemodel"
+        config_file = "deploy.prototxt"
+        
+        # 检查模型文件是否存在，如果不存在则需要下载
+        if not os.path.exists(model_file) or not os.path.exists(config_file):
+            logging.info("模型文件不存在，正在下载...")
+            self._download_model(model_file, config_file)
+        
+        # 加载DNN模型
+        try:
+            self.net = cv2.dnn.readNetFromCaffe(config_file, model_file)
+            logging.info("DNN模型加载成功")
+        except Exception as e:
+            logging.error(f"加载DNN模型失败: {e}")
+            raise
+    
+    def _download_model(self, model_file, config_file):
+        """下载预训练模型文件"""
+        try:
+            # 下载配置文件
+            if not os.path.exists(config_file):
+                logging.info("下载配置文件...")
+                config_url = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+                os.system(f'curl -o {config_file} {config_url}')
+            
+            # 下载模型文件
+            if not os.path.exists(model_file):
+                logging.info("下载模型文件...")
+                model_url = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20180205_fp16/res10_300x300_ssd_iter_140000_fp16.caffemodel"
+                os.system(f'curl -o {model_file} {model_url}')
+            
+            logging.info("模型文件下载完成")
+        except Exception as e:
+            logging.error(f"下载模型失败: {e}")
+            raise
+    
+    def detect_faces(self, image):
+        """使用DNN模型检测人脸"""
+        # 获取图像尺寸
+        (h, w) = image.shape[:2]
+        
+        # 准备图像数据进行前向传播
+        blob = cv2.dnn.blobFromImage(
+            cv2.resize(image, (300, 300)), 1.0,
+            (300, 300), (104.0, 177.0, 123.0)
+        )
+        
+        # 进行前向传播
+        self.net.setInput(blob)
+        detections = self.net.forward()
+        
+        # 存储检测到的人脸
+        faces = []
+        
+        # 处理检测结果
+        for i in range(0, detections.shape[2]):
+            # 提取置信度
+            confidence = detections[0, 0, i, 2]
+            
+            # 过滤低置信度的检测结果
+            if confidence > self.min_confidence:
+                # 计算人脸边界框坐标
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (startX, startY, endX, endY) = box.astype("int")
+                
+                # 确保边界框在图像范围内
+                startX = max(0, startX)
+                startY = max(0, startY)
+                endX = min(w, endX)
+                endY = min(h, endY)
+                
+                # 添加到结果列表
+                faces.append({
+                    'box': (startX, startY, endX - startX, endY - startY),
+                    'confidence': float(confidence)
+                })
+        
+        return faces
+
+class LightweightFaceDetector:
+    def __init__(self):
+        # 加载面部特征检测器（用于验证人脸）
+        self.frontal_face = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.alt2_face = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml')
+        self.profile_face = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_profileface.xml')
+        self.eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+        
+        # 检查分类器是否正确加载
+        if (self.frontal_face.empty() or self.alt2_face.empty() or 
+            self.profile_face.empty() or self.eye_cascade.empty()):
+            logging.error("无法加载级联分类器文件")
+            raise RuntimeError("无法加载级联分类器")
+        else:
+            logging.info("级联分类器加载成功")
+        
+        # 处理缩小的图像尺寸，降低计算复杂度
+        self.process_width = 320  # 处理宽度
+        
+        # 跟踪性能和检测状态
+        self.frame_count = 0
+        self.skip_count = 0
+        self.last_faces = []
+        self.frame_interval = 3  # 每隔多少帧进行一次完整检测
+        
+        # 人脸跟踪历史（用于时间连续性验证）
+        self.face_history = []
+        self.history_length = 5  # 保留多少帧的历史记录
+        self.confidence_scores = {}  # 跟踪每个人脸区域的置信度
+        
+        # 肤色范围（HSV色彩空间）
+        self.lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        self.upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+    
+    def enhance_image_fast(self, image):
+        """轻量级图像增强，优化计算性能"""
+        # 创建图像副本并缩小尺寸以加快处理速度
+        h, w = image.shape[:2]
+        scale = self.process_width / w
+        small_image = cv2.resize(image, (0, 0), fx=scale, fy=scale)
+        
+        # 转换到LAB色彩空间仅增强亮度通道
+        lab = cv2.cvtColor(small_image, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # 对亮度通道应用CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        cl = clahe.apply(l)
+        
+        # 合并通道
+        enhanced_lab = cv2.merge((cl, a, b))
+        
+        # 转换回BGR色彩空间
+        enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+        
+        return enhanced, scale
+    
+    def verify_face(self, image, x, y, w, h):
+        """验证检测到的区域是否真的是人脸"""
+        # 1. 检查面积和比例
+        if w < 20 or h < 20:  # 太小的区域可能是误检
+            return False
+        
+        aspect_ratio = w / h
+        if aspect_ratio < 0.5 or aspect_ratio > 1.5:  # 人脸宽高比通常在特定范围内
+            return False
+        
+        # 2. 提取人脸区域
+        face_roi = image[y:y+h, x:x+w]
+        if face_roi.size == 0:  # 如果区域无效
+            return False
+        
+        # 3. 肤色检测（在HSV色彩空间中）
+        try:
+            hsv = cv2.cvtColor(face_roi, cv2.COLOR_BGR2HSV)
+            skin_mask = cv2.inRange(hsv, self.lower_skin, self.upper_skin)
+            skin_ratio = cv2.countNonZero(skin_mask) / (w * h)
+            
+            # 如果肤色比例太低，可能不是人脸
+            if skin_ratio < 0.15:
+                return False
+        except Exception as e:
+            logging.debug(f"肤色检测出错: {e}")
+        
+        # 4. 眼睛检测（在灰度图中进行）
+        try:
+            gray_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+            eyes = self.eye_cascade.detectMultiScale(
+                gray_roi,
+                scaleFactor=1.1,
+                minNeighbors=2,
+                minSize=(int(w/10), int(h/10)),
+                maxSize=(int(w/3), int(h/3))
+            )
+            
+            # 如果检测到眼睛，增加置信度
+            has_eyes = len(eyes) > 0
+            
+            # 对于侧脸，可能只能检测到一只眼睛或没有眼睛
+            # 因此我们不用它作为严格的过滤条件，只用于辅助判断
+            return True
+        except Exception as e:
+            logging.debug(f"眼睛检测出错: {e}")
+            return True  # 如果出错，不以此作为过滤条件
+    
+    def update_face_history(self, faces):
+        """更新人脸历史记录，用于跟踪"""
+        # 添加当前帧的人脸到历史记录
+        self.face_history.append(faces)
+        
+        # 保持历史记录在指定长度内
+        if len(self.face_history) > self.history_length:
+            self.face_history.pop(0)
+        
+        # 如果历史记录不足，无法进行时间连续性检验
+        if len(self.face_history) < 2:
+            return faces
+        
+        # 更新每个人脸的置信度
+        current_faces = set(faces)
+        
+        # 初始化新检测到的人脸
+        for face in faces:
+            face_key = (face[0], face[1], face[2], face[3])
+            if face_key not in self.confidence_scores:
+                self.confidence_scores[face_key] = 1
+        
+        # 根据历史帧中的连续性增加置信度
+        for prev_faces in self.face_history[:-1]:  # 除了当前帧
+            for prev_face in prev_faces:
+                for curr_face in faces:
+                    # 检查两个人脸框是否有足够的重叠
+                    if self._boxes_overlap(prev_face, curr_face, 0.5):
+                        face_key = (curr_face[0], curr_face[1], curr_face[2], curr_face[3])
+                        # 增加置信度
+                        if face_key in self.confidence_scores:
+                            self.confidence_scores[face_key] += 1
+        
+        # 过滤掉置信度低的人脸（突然出现且不稳定的可能是误检）
+        verified_faces = []
+        for face in faces:
+            face_key = (face[0], face[1], face[2], face[3])
+            if face_key in self.confidence_scores and self.confidence_scores[face_key] >= 2:
+                verified_faces.append(face)
+        
+        # 清理不再存在的人脸记录
+        keys_to_remove = []
+        for face_key in self.confidence_scores:
+            # 检查当前人脸是否还在当前帧中
+            face_still_exists = False
+            for face in faces:
+                curr_key = (face[0], face[1], face[2], face[3])
+                if curr_key == face_key:
+                    face_still_exists = True
+                    break
+            
+            # 如果人脸不存在了，减少它的置信度
+            if not face_still_exists:
+                self.confidence_scores[face_key] -= 1
+                # 如果置信度降为0，计划移除
+                if self.confidence_scores[face_key] <= 0:
+                    keys_to_remove.append(face_key)
+        
+        # 移除不再活跃的人脸记录
+        for key in keys_to_remove:
+            del self.confidence_scores[key]
+        
+        return verified_faces
+    
+    def _boxes_overlap(self, box1, box2, threshold=0.5):
+        """检查两个边界框是否有足够的重叠"""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+        
+        # 计算交集区域
+        xx1 = max(x1, x2)
+        yy1 = max(y1, y2)
+        xx2 = min(x1 + w1, x2 + w2)
+        yy2 = min(y1 + h1, y2 + h2)
+        
+        # 检查是否有重叠
+        if xx2 < xx1 or yy2 < yy1:
+            return False
+        
+        # 计算重叠面积和两个框的面积
+        overlap_area = (xx2 - xx1) * (yy2 - yy1)
+        area1 = w1 * h1
+        area2 = w2 * h2
+        
+        # 计算交并比
+        iou = overlap_area / float(area1 + area2 - overlap_area)
+        
+        return iou > threshold
+    
+    def detect_faces(self, image):
+        """轻量级人脸检测，支持侧脸检测并减少误判"""
+        self.frame_count += 1
+        
+        # 如果不是检测帧，则返回上次的结果，维持高帧率
+        if self.frame_count % self.frame_interval != 0:
+            self.skip_count += 1
+            return self.last_faces, self.skip_count
+        
+        self.skip_count = 0
+        original_image = image.copy()
+        
+        # 快速增强并获取图像缩放比例
+        enhanced, scale = self.enhance_image_fast(image)
+        
+        # 转换为灰度图
+        gray = cv2.cvtColor(enhanced, cv2.COLOR_BGR2GRAY)
+        
+        # 使用正面人脸检测器（增加minNeighbors以减少误判）
+        faces1 = self.frontal_face.detectMultiScale(
+            gray, scaleFactor=1.2, minNeighbors=5, minSize=(20, 20)
+        )
+        
+        # 存储检测到的所有人脸
+        all_faces = []
+        
+        # 处理正面检测结果并应用验证
+        for (x, y, w, h) in faces1:
+            # 转换回原始图像坐标
+            orig_x = int(x/scale)
+            orig_y = int(y/scale)
+            orig_w = int(w/scale)
+            orig_h = int(h/scale)
+            
+            # 验证人脸
+            if self.verify_face(original_image, orig_x, orig_y, orig_w, orig_h):
+                all_faces.append((orig_x, orig_y, orig_w, orig_h))
+        
+        # 如果没有检测到正面人脸，或者检测到的人脸数量少于2个，尝试使用其他分类器
+        if len(all_faces) < 1:
+            # 使用第二个正面人脸检测器，参数略微提高以减少误判
+            faces2 = self.alt2_face.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
+            )
+            
+            for (x, y, w, h) in faces2:
+                # 转换回原始图像坐标
+                orig_x = int(x/scale)
+                orig_y = int(y/scale)
+                orig_w = int(w/scale)
+                orig_h = int(h/scale)
+                
+                # 验证人脸
+                if self.verify_face(original_image, orig_x, orig_y, orig_w, orig_h):
+                    all_faces.append((orig_x, orig_y, orig_w, orig_h))
+            
+            # 使用侧脸检测器，增加minNeighbors参数减少误判
+            profile_faces = self.profile_face.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
+            )
+            
+            for (x, y, w, h) in profile_faces:
+                # 转换回原始图像坐标
+                orig_x = int(x/scale)
+                orig_y = int(y/scale)
+                orig_w = int(w/scale)
+                orig_h = int(h/scale)
+                
+                # 验证人脸（侧脸通常更难验证，可能需要降低标准）
+                if self.verify_face(original_image, orig_x, orig_y, orig_w, orig_h):
+                    all_faces.append((orig_x, orig_y, orig_w, orig_h))
+            
+            # 镜像图像检测（可以检测另一侧的侧脸）
+            flipped_gray = cv2.flip(gray, 1)
+            flipped_profile_faces = self.profile_face.detectMultiScale(
+                flipped_gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
+            )
+            
+            # 调整镜像检测的坐标
+            img_width = gray.shape[1]
+            for (x, y, w, h) in flipped_profile_faces:
+                # 翻转回原始坐标系
+                flipped_x = img_width - x - w
+                
+                # 转换回原始图像坐标
+                orig_x = int(flipped_x/scale)
+                orig_y = int(y/scale)
+                orig_w = int(w/scale)
+                orig_h = int(h/scale)
+                
+                # 验证人脸
+                if self.verify_face(original_image, orig_x, orig_y, orig_w, orig_h):
+                    all_faces.append((orig_x, orig_y, orig_w, orig_h))
+        
+        # 仅在需要时应用非极大值抑制
+        if len(all_faces) > 1:
+            all_faces = self._fast_non_max_suppression(all_faces)
+        
+        # 应用时间连续性验证
+        verified_faces = self.update_face_history(all_faces)
+        
+        self.last_faces = verified_faces
+        return verified_faces, self.skip_count
+    
+    def _fast_non_max_suppression(self, boxes, overlap_thresh=0.3):
+        """简化版非极大值抑制，专注于性能"""
+        if len(boxes) == 0:
+            return []
+        
+        # 初始化最终框列表
+        final_boxes = []
+        
+        # 从大到小排序盒子（假设越大的盒子更可能是真实人脸）
+        boxes = sorted(boxes, key=lambda x: x[2]*x[3], reverse=True)
+        
+        # 追踪已经覆盖的矩形
+        picked = [False] * len(boxes)
+        
+        for i in range(len(boxes)):
+            if picked[i]:
+                continue
+                
+            final_boxes.append(boxes[i])
+            picked[i] = True
+            
+            x1, y1, w1, h1 = boxes[i]
+            area1 = w1 * h1
+            
+            # 检查是否与后续框重叠
+            for j in range(i + 1, len(boxes)):
+                if picked[j]:
+                    continue
+                    
+                x2, y2, w2, h2 = boxes[j]
+                
+                # 计算重叠区域
+                xx1 = max(x1, x2)
+                yy1 = max(y1, y2)
+                xx2 = min(x1 + w1, x2 + w2)
+                yy2 = min(y1 + h1, y2 + h2)
+                
+                # 检查是否有重叠
+                if xx2 > xx1 and yy2 > yy1:
+                    # 计算重叠面积
+                    overlap_area = (xx2 - xx1) * (yy2 - yy1)
+                    overlap_ratio = overlap_area / float(area1)
+                    
+                    # 如果重叠超过阈值，标记为已处理
+                    if overlap_ratio > overlap_thresh:
+                        picked[j] = True
+        
+        return final_boxes
+
+def face_detection(cap):
+    try:
+        # 初始化轻量级人脸检测器
+        detector = LightweightFaceDetector()
+        logging.info("启动轻量级高性能人脸检测...")
+        
+        # 跟踪帧率
+        fps_count = 0
+        fps_start = time.time()
+        fps = 0
+        
+        while cap.isOpened():
+            success, image = cap.read()
+            if not success:
+                logging.warning("无法读取摄像头图像")
+                continue
+            
+            # 翻转图像以获得镜像效果
+            image = cv2.flip(image, 1)
+            
+            # 更新帧率计算
+            fps_count += 1
+            current_time = time.time()
+            if current_time - fps_start >= 1.0:  # 每秒更新一次
+                fps = fps_count / (current_time - fps_start)
+                fps_count = 0
+                fps_start = current_time
+            
+            # 使用轻量级检测
+            faces, skipped = detector.detect_faces(image)
+            
+            # 显示原始图像
+            disp_image = image.copy()
+            
+            # 在每个检测到的人脸周围绘制矩形
+            for (x, y, w, h) in faces:
+                # 绘制人脸边界框
+                cv2.rectangle(disp_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # 只显示帧率信息
+            cv2.putText(disp_image, f"FPS: {fps:.1f}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # 显示结果
+            cv2.imshow('人脸检测', disp_image)
+            
+            # 按ESC键退出
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                logging.info("ESC键被按下，正在退出...")
+                break
+                
+    finally:
+        logging.info("清理资源...")
+        cap.release()
+        cv2.destroyAllWindows()
+
+def main_fun():
+    cap = cv2.VideoCapture(0)
+    # 可以考虑降低摄像头捕获分辨率来提升性能
+    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    face_detection(cap)
+
+if __name__ == "__main__":
+    main_fun()
